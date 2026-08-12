@@ -1,0 +1,38 @@
+name: Haber Bot
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-haber-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Kütüphaneleri kur
+        run: pip install -r requirements.txt
+
+      - name: Haberleri tara ve gönder
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python haber_bot.py
+
+      - name: Gönderilenler listesini kaydet
+        run: |
+          git config user.name "haber-bot"
+          git config user.email "haber-bot@users.noreply.github.com"
+          git add seen_items.json
+          git diff --staged --quiet || git commit -m "seen_items güncellendi"
+          git push
