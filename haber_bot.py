@@ -17,8 +17,8 @@ from calendar import timegm
 
 # ============ AYARLAR ============
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8889739318:AAEYbJ8cy8UNeqwA00C_DeZuEoECXqqfxN4")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6841282915")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_FILE = os.path.join(SCRIPT_DIR, "seen_items.json")
@@ -211,6 +211,10 @@ def format_message(item):
 
 def main():
     print(f"[{datetime.now()}] Tarama başlıyor...")
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[HATA] TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID ayarlanmamış (GitHub Secrets kontrol et).")
+        return
 
     seen = load_seen()
     entries = fetch_all_entries()
