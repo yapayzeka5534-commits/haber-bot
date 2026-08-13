@@ -3,11 +3,7 @@
 Bülten Almanya - Gurbetçi Haber Takip Botu
 --------------------------------------------
 Google News RSS ve DW Türkçe RSS üzerinden Almanya'da yaşayan Türkleri
-ilgilendiren haberleri tarar, anahtar kelime bazlı filtreler ve
-Telegram üzerinden bildirim gönderir.
-
-Çalıştırma: python haber_bot.py
-(Windows Görev Zamanlayıcı ile her 15-20 dakikada bir otomatik çalıştırılması önerilir)
+ve genel Türkiye gündemini tarar, filtreler ve Telegram'a bildirim gönderir.
 """
 
 import feedparser
@@ -15,51 +11,60 @@ import requests
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
+from calendar import timegm
 
 # ============ AYARLAR ============
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8889739318:AAEYbJ8cy8UNeqwA00C_DeZuEoECXqqfxN4")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6841282915")
 
-# Script'in dosya konumuna göre "daha önce gönderilenler" listesini saklar
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_FILE = os.path.join(SCRIPT_DIR, "seen_items.json")
 
-# Google News RSS için arama sorguları (Türkçe, Almanya odaklı)
-# Her biri ayrı bir RSS akışı olarak taranır
-GOOGLE_NEWS_QUERIES = [
+# Bir haberin en fazla kaç saat önce yayınlanmış olabileceği (bundan eskisi elenir)
+FRESHNESS_HOURS = 6
+
+# ---- Kategori 1: Almanya'daki Türkleri ilgilendiren haberler ----
+GERMANY_QUERIES = [
     "Almanya Türkleri",
     "gurbetçi Almanya",
     "Almanya'da Türk",
     "Almanya yaşayan Türkler",
     "Berlin Türkler",
     "Almanya Türk toplumu",
-    "Almanya'da Türk vatandaşı",
     "Almanya vize Türk",
     "Almanya oturma izni",
     "Almanya Türk işçi",
 ]
 
-# Ek sabit RSS kaynakları (site geneli, sonra anahtar kelimeyle filtrelenir)
-EXTRA_FEEDS = [
-    "https://rss.dw.com/rdf/rss-tur-all",  # DW Türkçe - genel akış
+# ---- Kategori 2: Genel Türkiye gündemi / son dakika ----
+TURKEY_AGENDA_QUERIES = [
+    "Türkiye son dakika",
+    "Türkiye gündem",
+    "Türkiye ekonomi son dakika",
+    "Türkiye siyaset son dakika",
 ]
 
-# Bir haberin "gurbetçiyi ilgilendirir" sayılması için başlık/özette
-# aranacak anahtar kelimeler (en az biri geçmeli)
-INCLUDE_KEYWORDS = [
+EXTRA_FEEDS = [
+    ("https://rss.dw.com/rdf/rss-tur-all", "🇩🇪 Almanya Türkleri"),
+]
+
+# Bir haberin alakalı sayılması için (Almanya kategorisi) geçmesi gereken kelimeler
+GERMANY_INCLUDE_KEYWORDS = [
     "almanya", "alman", "berlin", "köln", "koln", "münih", "munih",
     "stuttgart", "frankfurt", "hamburg", "gurbetçi", "gurbetci",
     "göçmen", "gocmen", "diaspora", "vize", "oturma izni", "sınır dışı",
     "sinir disi", "işçi", "isci", "türk toplumu", "turk toplumu",
 ]
 
-# Kesinlikle istenmeyen konular (bunlardan biri geçerse ELENIR)
+# Kesinlikle istenmeyen içerik türleri (köşe yazısı, analiz, spor vb.)
 EXCLUDE_KEYWORDS = [
     "maç sonucu", "mac sonucu", "gol attı", "gol atti", "transfer haberi",
-    "hava durumu",
+    "hava durumu", "köşe yazısı", "kose yazisi", "yorumu:", "analiz:",
+    "podcast", "canlı yayın", "canli yayin", "burç yorum", "burc yorum",
+    "ne izlesek", "haftalık gündem özeti",
 ]
 
 # ============ YARDIMCI FONKSİYONLAR ============
@@ -72,8 +77,7 @@ def load_seen():
 
 
 def save_seen(seen_ids):
-    # Dosyanın sonsuza kadar büyümesini engellemek için son 2000 kaydı tut
-    trimmed = list(seen_ids)[-2000:]
+    trimmed = list(seen_ids)[-3000:]
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f, ensure_ascii=False)
 
@@ -82,43 +86,94 @@ def normalize(text):
     return (text or "").lower()
 
 
-def is_relevant(title, summary):
+def is_excluded(title, summary):
     text = normalize(title) + " " + normalize(summary)
+    return any(bad in text for bad in EXCLUDE_KEYWORDS)
 
-    for bad in EXCLUDE_KEYWORDS:
-        if bad in text:
-            return False
 
-    for good in INCLUDE_KEYWORDS:
-        if good in text:
-            return True
-
-    return False
+def is_germany_relevant(title, summary):
+    text = normalize(title) + " " + normalize(summary)
+    return any(good in text for good in GERMANY_INCLUDE_KEYWORDS)
 
 
 def build_google_news_url(query):
-    q = quote(query)
+    # "when:6h" -> Google News'e son 6 saat filtresini kendisi uygular
+    q = quote(f"{query} when:{FRESHNESS_HOURS}h")
     return f"https://news.google.com/rss/search?q={q}&hl=tr&gl=DE&ceid=DE:tr"
 
 
-def fetch_all_entries():
-    feeds = [build_google_news_url(q) for q in GOOGLE_NEWS_QUERIES] + EXTRA_FEEDS
-    all_entries = []
-    for url in feeds:
+def is_fresh_enough(entry):
+    """published_parsed yoksa güvenlik payı ile geçerli say."""
+    struct = entry.get("published_parsed")
+    if not struct:
+        return True
+    published_dt = datetime.fromtimestamp(timegm(struct), tz=timezone.utc)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=FRESHNESS_HOURS + 1)
+    return published_dt >= cutoff
+
+
+def fetch_category(queries, category_label, apply_germany_filter):
+    entries = []
+    for q in queries:
+        url = build_google_news_url(q)
         try:
             parsed = feedparser.parse(url)
             for entry in parsed.entries:
-                all_entries.append({
+                if not is_fresh_enough(entry):
+                    continue
+                title = entry.get("title", "").strip()
+                summary = re.sub("<[^<]+?>", "", entry.get("summary", "")).strip()
+                if is_excluded(title, summary):
+                    continue
+                if apply_germany_filter and not is_germany_relevant(title, summary):
+                    continue
+                entries.append({
                     "id": entry.get("id") or entry.get("link"),
-                    "title": entry.get("title", "").strip(),
+                    "title": title,
                     "link": entry.get("link", "").strip(),
-                    "summary": re.sub("<[^<]+?>", "", entry.get("summary", "")).strip(),
-                    "source": parsed.feed.get("title", "Bilinmeyen Kaynak"),
-                    "published": entry.get("published", ""),
+                    "summary": summary,
+                    "source": parsed.feed.get("title", "Google News"),
+                    "category": category_label,
                 })
         except Exception as e:
             print(f"[UYARI] Feed alınamadı: {url} -> {e}")
+    return entries
+
+
+def fetch_all_entries():
+    all_entries = []
+    all_entries += fetch_category(GERMANY_QUERIES, "🇩🇪 Almanya Türkleri", apply_germany_filter=False)
+    all_entries += fetch_category(TURKEY_AGENDA_QUERIES, "🇹🇷 Türkiye Gündemi", apply_germany_filter=False)
+
+    for url, label in EXTRA_FEEDS:
+        try:
+            parsed = feedparser.parse(url)
+            for entry in parsed.entries:
+                if not is_fresh_enough(entry):
+                    continue
+                title = entry.get("title", "").strip()
+                summary = re.sub("<[^<]+?>", "", entry.get("summary", "")).strip()
+                if is_excluded(title, summary):
+                    continue
+                all_entries.append({
+                    "id": entry.get("id") or entry.get("link"),
+                    "title": title,
+                    "link": entry.get("link", "").strip(),
+                    "summary": summary,
+                    "source": parsed.feed.get("title", "DW Türkçe"),
+                    "category": label,
+                })
+        except Exception as e:
+            print(f"[UYARI] Feed alınamadı: {url} -> {e}")
+
     return all_entries
+
+
+def build_search_links(title):
+    q = quote(title[:80])
+    x_url = f"https://twitter.com/search?q={q}&f=live"
+    tiktok_url = f"https://www.tiktok.com/search?q={q}"
+    return x_url, tiktok_url
 
 
 def send_telegram_message(text):
@@ -141,7 +196,15 @@ def format_message(item):
     title = item["title"]
     link = item["link"]
     source = item["source"]
-    return f"📰 <b>{title}</b>\n\n🔗 {link}\n📌 Kaynak: {source}"
+    category = item["category"]
+    x_url, tiktok_url = build_search_links(title)
+    return (
+        f"{category}\n"
+        f"📰 <b>{title}</b>\n\n"
+        f"🔗 {link}\n"
+        f"📌 Kaynak: {source}\n\n"
+        f"🔎 <a href=\"{x_url}\">X'te ara</a> | 🎵 <a href=\"{tiktok_url}\">TikTok'ta ara</a>"
+    )
 
 
 # ============ ANA AKIŞ ============
@@ -149,25 +212,20 @@ def format_message(item):
 def main():
     print(f"[{datetime.now()}] Tarama başlıyor...")
 
-    if TELEGRAM_CHAT_ID == "BURAYA_CHAT_ID_GELECEK":
-        print("[HATA] Önce TELEGRAM_CHAT_ID değerini ayarla!")
-        return
-
     seen = load_seen()
     entries = fetch_all_entries()
-    print(f"Toplam {len(entries)} haber tarandı.")
+    print(f"Toplam {len(entries)} haber tarandı (tazelik ve filtre sonrası).")
 
-    new_relevant = []
+    new_items = []
     for item in entries:
         if not item["id"] or item["id"] in seen:
             continue
-        if is_relevant(item["title"], item["summary"]):
-            new_relevant.append(item)
+        new_items.append(item)
         seen.add(item["id"])
 
-    print(f"{len(new_relevant)} yeni ve alakalı haber bulundu.")
+    print(f"{len(new_items)} yeni haber bulundu.")
 
-    for item in new_relevant:
+    for item in new_items:
         send_telegram_message(format_message(item))
 
     save_seen(seen)
